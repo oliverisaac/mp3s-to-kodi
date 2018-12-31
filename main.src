@@ -9,49 +9,80 @@ set -o pipefail # Failed commands in pipes cause the whole pipe to fail
 
 LOG_LEVEL=0
 
+readonly hash_cache=$( mktemp )
+
 function main()
 {
     local destination="$1"
     shift
     local search_folders=( "${@}" )
-    
+    hash_files_in_folder "$destination"
+
     for f in "${search_folders[@]}"; do
         search_folder "$destination" "$f"
     done
 }
 
-function get_md5_sums_from_folder()
-{
+function hash_files_in_folder()
+{(
     local folder="$1"
+    local hash file
+    while IFS= read -r -d '' file; do
+        hash=$( hash_file "$file" ) 
+        save_hash "$hash" "$file"
+    done < <( find "$folder" -type f -print0 )
+)}
 
-    find "$folder" -type f -print0 | while IFS= read -r -d '' file; do
-        hash_file "$file"
-    done
-}
+function save_hash()
+{(
+    local hash="$1"
+    local file="$2"
+
+    printf "%s:%s\n" "$hash" "$file" >> "$hash_cache"
+)}
+
+# Pass in a hash. If it's already found, then return the file(s) associated with that hash.
+function search_hash()
+{(
+    local hash="$1"
+    local result
+    
+    if ! result=$( grep -e "^$hash:" "$hash_cache" ); then
+        log 2 "Hash $hash not found in $hash_cache"
+        return 1
+    fi
+    
+    if [[ $result == "" ]]; then
+        log 2 "Result is blank"
+        return 1
+    fi
+
+    while IFS=$'\n' read -r line; do
+        echo "${line#*:}" 
+    done <<< "$result"
+
+    return 0
+)}
 
 function search_folder()
 {(
     local destination="$1"
     local folder="$2"
-    # We hash it now and then add hashes as we go. Need to hash all files for every folder we search
-    local md5_sums=$( get_md5_sums_from_folder "$destination" )
 
     folder=$( readlink -f "$folder" )
     while IFS= read -r -d '' file; do
         full_path=$( readlink -f "$file" )
-        if check_and_move_file "$destination" "$file"; then
-            file_sum=$( hash_file "$file" )
-            md5_sums=$( printf "%s\n" "$md5_sums" "$file_sum" )  
-        fi
+        check_and_move_file "$destination" "$file"
     done < <( find "$folder" -type f -print0 )
 )}
 
 function hash_file()
 {(
     for f in "${@}"; do
-        md5sum "${@}" 
+        sha256sum "${@}" 
     done | awk '{print $1}'
 )}
+
 function check_and_move_file()
 {(
     local destination="$1"
@@ -61,16 +92,19 @@ function check_and_move_file()
         # New name is the original file name with any form of .MP3 changed to .mp3 (all lower case).
         # If it doens't end in .mp3 then .mp3 is appende.
         local new_name="$( basename "$file" | sed -r -e 's/([.][mM][pP][3])?$/.mp3/' )"
-        local md5_sum=$( hash_file "$file" ) 
-        if ! grep -qwe "$md5_sum" <<< "$md5_sums"; then
-            log 0 "Copying $file"
+        local hash=$( hash_file "$file" ) 
+        if existing_file=$( search_hash "$hash" ); then
+            log 0 "File $file already saved as $existing_file"
+        else
+            log 0 "Copying $file to $destination/$new_name"
             cp "$file" "$destination/$new_name"
-            return 0
+            save_hash "$hash" "$destination/$new_name"
         fi
+    else
+        log 0 "File $file is not an mp3"
     fi
 
-    log 0 "Skipping $file"
-    return 1
+    return 0
 )}
 
 function file_is_mp3()
@@ -102,6 +136,13 @@ EOF
 shource parse_args()
 shource log()
 shource traps()
+
+function _on_exit()
+{
+    if [[ -e "$hash_cache" ]]; then
+        rm "$hash_cache"
+    fi
+}
 
 # Check if any of the args are a cry for help
 if echo "${@}" | grep -q -wiEe "-h|--help|help"; then
