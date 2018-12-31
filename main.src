@@ -1,0 +1,115 @@
+#!/usr/bin/env shource
+# vim: autoindent tabstop=4 shiftwidth=4 expandtab softtabstop=4 ft=sh
+
+set -e # Exit on any error. Use `COMMAND || true` to nullify
+set -E # Functions inherit error trap
+set -u # Error on unset variables. Use ${var:-alternate value} to bypass
+set -f # Error on failed file globs (e.g. *.txt )
+set -o pipefail # Failed commands in pipes cause the whole pipe to fail
+
+LOG_LEVEL=0
+
+function main()
+{
+    local destination="$1"
+    shift
+    local search_folders=( "${@}" )
+    
+    for f in "${search_folders[@]}"; do
+        search_folder "$destination" "$f"
+    done
+}
+
+function get_md5_sums_from_folder()
+{
+    local folder="$1"
+
+    find "$folder" -type f -print0 | while IFS= read -r -d '' file; do
+        hash_file "$file"
+    done
+}
+
+function search_folder()
+{(
+    local destination="$1"
+    local folder="$2"
+    # We hash it now and then add hashes as we go. Need to hash all files for every folder we search
+    local md5_sums=$( get_md5_sums_from_folder "$destination" )
+
+    folder=$( readlink -f "$folder" )
+    while IFS= read -r -d '' file; do
+        full_path=$( readlink -f "$file" )
+        if check_and_move_file "$destination" "$file"; then
+            file_sum=$( hash_file "$file" )
+            md5_sums=$( printf "%s\n" "$md5_sums" "$file_sum" )  
+        fi
+    done < <( find "$folder" -type f -print0 )
+)}
+
+function hash_file()
+{(
+    for f in "${@}"; do
+        md5sum "${@}" 
+    done | awk '{print $1}'
+)}
+function check_and_move_file()
+{(
+    local destination="$1"
+    local file="$2"
+
+    if file_is_mp3 "$file"; then
+        # New name is the original file name with any form of .MP3 changed to .mp3 (all lower case).
+        # If it doens't end in .mp3 then .mp3 is appende.
+        local new_name="$( basename "$file" | sed -r -e 's/([.][mM][pP][3])?$/.mp3/' )"
+        local md5_sum=$( hash_file "$file" ) 
+        if ! grep -qwe "$md5_sum" <<< "$md5_sums"; then
+            log 0 "Copying $file"
+            cp "$file" "$destination/$new_name"
+            return 0
+        fi
+    fi
+
+    log 0 "Skipping $file"
+    return 1
+)}
+
+function file_is_mp3()
+{(
+    local file="$1"
+    local ret=1
+
+    local mime_type=$( file --mime-type "$file" )
+    mime_type="${mime_type##*: }"
+
+    if [[ $mime_type == "audio/mpeg" ]]; then
+        ret=2
+        if file "$file" | grep -q "layer III"; then
+            ret=0
+        fi
+    fi
+
+    return $ret
+)}
+
+function _display_help()
+{
+    cat - > >( sed -r -e "s/^ {,8}//" ) <<EOF
+        Sample help file
+        TADA!
+EOF
+}
+
+shource parse_args()
+shource log()
+shource traps()
+
+# Check if any of the args are a cry for help
+if echo "${@}" | grep -q -wiEe "-h|--help|help"; then
+    _display_help
+    exit 4
+fi
+
+parse_args search:array -- "${@}"
+main  "${destination}" "${search[@]}"
+
+exit $?
